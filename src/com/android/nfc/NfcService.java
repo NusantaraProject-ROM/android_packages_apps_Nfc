@@ -131,6 +131,9 @@ public class NfcService implements DeviceHostListener {
     static final String PREF_FIRST_BEAM = "first_beam";
     static final String PREF_FIRST_BOOT = "first_boot";
 
+    static final String PREF_ANTENNA_BLOCKED_MESSAGE_SHOWN = "antenna_blocked_message_shown";
+    static final boolean ANTENNA_BLOCKED_MESSAGE_SHOWN_DEFAULT = false;
+
     static final String TRON_NFC_CE = "nfc_ce";
     static final String TRON_NFC_P2P = "nfc_p2p";
     static final String TRON_NFC_TAG = "nfc_tag";
@@ -155,6 +158,9 @@ public class NfcService implements DeviceHostListener {
     static final int MSG_UPDATE_STATS = 15;
     static final int MSG_APPLY_SCREEN_STATE = 16;
     static final int MSG_TRANSACTION_EVENT = 17;
+
+    // Negative value for NO polling delay
+    static final int NO_POLL_DELAY = -1;
 
     // Update stats every 4 hours
     static final long STATS_UPDATE_INTERVAL_MS = 4 * 60 * 60 * 1000;
@@ -245,6 +251,11 @@ public class NfcService implements DeviceHostListener {
     private int mUserId;
     boolean mPollingPaused;
 
+    // True if nfc notification message already shown
+    boolean mAntennaBlockedMessageShown;
+    private static int mDispatchFailedCount;
+    private static int mDispatchFailedMax;
+
     static final int INVALID_NATIVE_HANDLE = -1;
     byte mDebounceTagUid[];
     int mDebounceTagDebounceMs;
@@ -283,6 +294,9 @@ public class NfcService implements DeviceHostListener {
     boolean mIsHceFCapable;
     boolean mIsBeamCapable;
     boolean mIsSecureNfcCapable;
+
+    int mPollDelay;
+    boolean mNotifyDispatchFailed;
 
     private NfcDispatcher mNfcDispatcher;
     private PowerManager mPowerManager;
@@ -505,6 +519,22 @@ public class NfcService implements DeviceHostListener {
             mIsSecureNfcCapable;
         mDeviceHost.setNfcSecure(mIsSecureNfcEnabled);
 
+
+        // Notification message variables
+        mDispatchFailedCount = 0;
+        if (mContext.getResources().getBoolean(R.bool.enable_antenna_blocked_alert) &&
+            !mPrefs.getBoolean(PREF_ANTENNA_BLOCKED_MESSAGE_SHOWN, ANTENNA_BLOCKED_MESSAGE_SHOWN_DEFAULT)) {
+            mAntennaBlockedMessageShown = false;
+            mDispatchFailedMax =
+                mContext.getResources().getInteger(R.integer.max_antenna_blocked_failure_count);
+        } else {
+            mAntennaBlockedMessageShown = true;
+        }
+
+        // Polling delay variables
+        mPollDelay = mContext.getResources().getInteger(R.integer.unknown_tag_polling_delay);
+        mNotifyDispatchFailed = mContext.getResources().getBoolean(R.bool.enable_notify_dispatch_failed);
+
         // Make sure this is only called when object construction is complete.
         ServiceManager.addService(SERVICE_NAME, mNfcAdapter);
 
@@ -645,6 +675,7 @@ public class NfcService implements DeviceHostListener {
                         Log.d(TAG, "NFC is off.  Checking firmware version");
                         initialized = mDeviceHost.checkFirmware();
                     }
+
                     if (initialized) {
                         SystemProperties.set("nfc.initialized", "true");
                     }
@@ -900,6 +931,7 @@ public class NfcService implements DeviceHostListener {
                 mPollingPaused = false;
                 new ApplyRoutingTask().execute();
             }
+            if (DBG) Log.d(TAG, "Polling is resumed");
         }
 
         @Override
@@ -2561,7 +2593,14 @@ public class NfcService implements DeviceHostListener {
                 }
                 int dispatchResult = mNfcDispatcher.dispatchTag(tag);
                 if (dispatchResult == NfcDispatcher.DISPATCH_FAIL && !mInProvisionMode) {
+                    if (DBG) Log.d(TAG, "Tag dispatch failed");
                     unregisterObject(tagEndpoint.getHandle());
+                    if (mPollDelay > NO_POLL_DELAY) {
+                        tagEndpoint.stopPresenceChecking();
+                        mNfcAdapter.pausePolling(mPollDelay);
+                    } else {
+                        Log.e(TAG, "Keep presence checking.");
+                    }
                     if (mScreenState == ScreenStateHelper.SCREEN_STATE_ON_UNLOCKED &&
                         mContext.getResources().getBoolean(R.bool.enable_notify_dispatch_failed)) {
                         if (mToast != null) {
@@ -2570,9 +2609,22 @@ public class NfcService implements DeviceHostListener {
                         mToast = Toast.makeText(mContext, R.string.tag_dispatch_failed,
                                                 Toast.LENGTH_SHORT);
                         mToast.show();
+                        playSound(SOUND_ERROR);
                     }
-                    playSound(SOUND_ERROR);
+                    if (!mAntennaBlockedMessageShown && mDispatchFailedCount++ > mDispatchFailedMax) {
+                        Intent dialogIntent = new Intent(mContext, NfcBlockedNotification.class);
+                        dialogIntent.setFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                        mContext.startActivity(dialogIntent);
+                        mPrefsEditor.putBoolean(PREF_ANTENNA_BLOCKED_MESSAGE_SHOWN, true);
+                        mPrefsEditor.apply();
+                        mBackupManager.dataChanged();
+                        mAntennaBlockedMessageShown = true;
+                        mDispatchFailedCount = 0;
+                        if (DBG) Log.d(TAG, "Tag dispatch failed notification");
+                    }
                 } else if (dispatchResult == NfcDispatcher.DISPATCH_SUCCESS) {
+                    mDispatchFailedCount = 0;
                     mVibrator.vibrate(mVibrationEffect);
                     playSound(SOUND_END);
                 }
