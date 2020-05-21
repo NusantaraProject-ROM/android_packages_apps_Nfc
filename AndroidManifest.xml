@@ -56,6 +56,7 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
     <uses-permission android:name="android.permission.NETWORK_SETTINGS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
 
     <application android:name=".NfcApplication"
                  android:icon="@drawable/icon"
@@ -127,6 +128,7 @@
             android:theme="@android:style/Theme.Translucent"
             android:label="@string/android_beam"
             android:noHistory="true"
+            android:exported="true"
             android:excludeFromRecents="true">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -153,7 +155,8 @@
             android:process=":beam"
         />
 
-        <receiver android:name=".NfcBootCompletedReceiver">
+        <receiver android:name=".NfcBootCompletedReceiver"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
