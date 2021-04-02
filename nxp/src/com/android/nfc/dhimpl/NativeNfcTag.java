@@ -16,7 +16,6 @@
 
 package com.android.nfc.dhimpl;
 
-import android.annotation.Nullable;
 import com.android.nfc.DeviceHost;
 import com.android.nfc.DeviceHost.TagEndpoint;
 
@@ -30,7 +29,6 @@ import android.nfc.tech.NfcA;
 import android.nfc.tech.NfcB;
 import android.nfc.tech.NfcF;
 import android.nfc.tech.NfcV;
-import android.nfc.tech.NfcBarcode;
 import android.nfc.tech.TagTechnology;
 import android.os.Bundle;
 import android.util.Log;
@@ -39,7 +37,7 @@ import android.util.Log;
  * Native interface to the NFC tag functions
  */
 public class NativeNfcTag implements TagEndpoint {
-    static final boolean DBG = true;
+    static final boolean DBG = false;
 
     static final int STATUS_CODE_TARGET_LOST = 146;
 
@@ -72,16 +70,15 @@ public class NativeNfcTag implements TagEndpoint {
     private PresenceCheckWatchdog mWatchdog;
     class PresenceCheckWatchdog extends Thread {
 
-        private final int watchdogTimeout;
         private DeviceHost.TagDisconnectedCallback tagDisconnectedCallback;
+        private int watchdogTimeout;
 
         private boolean isPresent = true;
         private boolean isStopped = false;
         private boolean isPaused = false;
         private boolean doCheck = true;
 
-        public PresenceCheckWatchdog(int presenceCheckDelay,
-                                     @Nullable DeviceHost.TagDisconnectedCallback callback) {
+        public PresenceCheckWatchdog(int presenceCheckDelay, DeviceHost.TagDisconnectedCallback callback) {
             watchdogTimeout = presenceCheckDelay;
             tagDisconnectedCallback = callback;
         }
@@ -111,8 +108,8 @@ public class NativeNfcTag implements TagEndpoint {
 
         @Override
         public void run() {
+            if (DBG) Log.d(TAG, "Starting background presence check");
             synchronized (this) {
-                if (DBG) Log.d(TAG, "Starting background presence check");
                 while (isPresent && !isStopped) {
                     try {
                         if (!isPaused) {
@@ -151,6 +148,10 @@ public class NativeNfcTag implements TagEndpoint {
 
     private native int doConnect(int handle);
     public synchronized int connectWithStatus(int technology) {
+        if (technology == TagTechnology.NFC_B) {
+            // Not supported by PN544
+            return -1;
+        }
         if (mWatchdog != null) {
             mWatchdog.pause();
         }
@@ -167,13 +168,10 @@ public class NativeNfcTag implements TagEndpoint {
                     //    switching to that.
                     if (mConnectedHandle == -1) {
                         // Not connected yet
-                        //status = doConnect(mTechHandles[i]);
-                        status = doConnect(i);
+                        status = doConnect(mTechHandles[i]);
                     } else {
                         // Connect to a tech with a different handle
-                        Log.d(TAG,"Connect to a tech with a different handle");
-                        //status = reconnectWithStatus(mTechHandles[i]);
-                        status = reconnectWithStatus(i);
+                        status = reconnectWithStatus(mTechHandles[i]);
                     }
                     if (status == 0) {
                         mConnectedHandle = mTechHandles[i];
@@ -188,31 +186,18 @@ public class NativeNfcTag implements TagEndpoint {
                     //    allowed.
                     if ((technology == TagTechnology.NDEF) ||
                             (technology == TagTechnology.NDEF_FORMATABLE)) {
-                        // special case for NDEF, this will cause switch to ISO_DEP frame intf
-                        i = 0;
-                       // status = 0;
-                    } 
-                    status = reconnectWithStatus(i);
-                        /*
+                        status = 0;
+                    } else {
                         if ((technology != TagTechnology.ISO_DEP) &&
                             (hasTechOnHandle(TagTechnology.ISO_DEP, mTechHandles[i]))) {
                             // Don't allow to connect a -4 tag at a different level
                             // than IsoDep, as this is not supported by
                             // libNFC.
-                            // revised for NFCA... do allow to connect a -4 tag at this level.
-                            Log.d(TAG,"Connect to a tech with same different handle (rf intf change)");
-                            status = reconnectWithStatus(i);
-                            if (status == 0) {
-                                mConnectedHandle = mTechHandles[i];
-                                mConnectedTechIndex = i;
-                            }
-                            //status = 0;
+                            status = -1;
                         } else {
                             status = 0;
                         }
-                        */
-                    
-                    
+                    }
                     if (status == 0) {
                         mConnectedTechIndex = i;
                         // Handle was already identical
@@ -245,6 +230,9 @@ public class NativeNfcTag implements TagEndpoint {
         // Once we start presence checking, we allow the upper layers
         // to know the tag is in the field.
         mIsPresent = true;
+        if (mConnectedTechIndex == -1 && mTechList.length > 0) {
+            connect(mTechList[0]);
+        }
         if (mWatchdog == null) {
             mWatchdog = new PresenceCheckWatchdog(presenceCheckDelay, callback);
             mWatchdog.start();
@@ -259,24 +247,19 @@ public class NativeNfcTag implements TagEndpoint {
     }
     native boolean doDisconnect();
     @Override
-    public boolean disconnect() {
+    public synchronized boolean disconnect() {
         boolean result = false;
-        PresenceCheckWatchdog watchdog;
-        synchronized (this) {
-            mIsPresent = false;
-            watchdog = mWatchdog;
-        }
-        if (watchdog != null) {
+
+        mIsPresent = false;
+        if (mWatchdog != null) {
             // Watchdog has already disconnected or will do it
-            watchdog.end(false);
+            mWatchdog.end(false);
             try {
-                watchdog.join();
+                mWatchdog.join();
             } catch (InterruptedException e) {
                 // Should never happen.
             }
-            synchronized (this) {
-                mWatchdog = null;
-            }
+            mWatchdog = null;
             result = true;
         } else {
             result = doDisconnect();
@@ -418,11 +401,32 @@ public class NativeNfcTag implements TagEndpoint {
     native boolean doIsIsoDepNdefFormatable(byte[] poll, byte[] act);
     @Override
     public synchronized boolean isNdefFormatable() {
-        // Let native code decide whether the currently activated tag
-        // is formatable.  Although the name of the JNI function refers
-        // to ISO-DEP, the JNI function checks all tag types.
-        return doIsIsoDepNdefFormatable(mTechPollBytes[0],
-                mTechActBytes[0]);
+        if (hasTech(TagTechnology.MIFARE_CLASSIC) || hasTech(TagTechnology.MIFARE_ULTRALIGHT)) {
+            // These are always formatable
+            return true;
+        }
+        if (hasTech(TagTechnology.NFC_V)) {
+            // Currently libnfc only formats NXP NFC-V tags
+            if (mUid[5] >= 1 && mUid[5] <= 3 && mUid[6] == 0x04) {
+                return true;
+            } else {
+                return false;
+            }
+        }
+        // For ISO-DEP, call native code to determine at lower level if format
+        // is possible. It will need NFC-A poll/activation time bytes for this.
+        if (hasTech(TagTechnology.ISO_DEP)) {
+            int nfcaTechIndex = getTechIndex(TagTechnology.NFC_A);
+            if (nfcaTechIndex != -1) {
+                return doIsIsoDepNdefFormatable(mTechPollBytes[nfcaTechIndex],
+                        mTechActBytes[nfcaTechIndex]);
+            } else {
+                return false;
+            }
+        } else {
+            // Formatting not supported by libNFC
+            return false;
+        }
     }
 
     @Override
@@ -510,19 +514,6 @@ public class NativeNfcTag implements TagEndpoint {
                 System.arraycopy(mTechLibNfcTypes, techIndex + 1, mNewTypeList, techIndex,
                         mTechLibNfcTypes.length - techIndex - 1);
                 mTechLibNfcTypes = mNewTypeList;
-
-                //The technology must be removed from the mTechExtras array,
-                //just like the above arrays.
-                //Remove the specified element from the array,
-                //then shift the remaining elements by one.
-                if (mTechExtras != null)
-                {
-                    Bundle[] mNewTechExtras = new Bundle[mTechExtras.length - 1];
-                    System.arraycopy(mTechExtras, 0, mNewTechExtras, 0, techIndex);
-                    System.arraycopy(mTechExtras, techIndex + 1, mNewTechExtras, techIndex,
-                        mTechExtras.length - techIndex - 1);
-                    mTechExtras = mNewTechExtras;
-                }
             }
         }
     }
@@ -663,7 +654,6 @@ public class NativeNfcTag implements TagEndpoint {
             for (int i = 0; i < mTechList.length; i++) {
                 Bundle extras = new Bundle();
                 switch (mTechList[i]) {
-                    case TagTechnology.MIFARE_CLASSIC:
                     case TagTechnology.NFC_A: {
                         byte[] actBytes = mTechActBytes[i];
                         if ((actBytes != null) && (actBytes.length > 0)) {
@@ -729,12 +719,6 @@ public class NativeNfcTag implements TagEndpoint {
                     case TagTechnology.MIFARE_ULTRALIGHT: {
                         boolean isUlc = isUltralightC();
                         extras.putBoolean(MifareUltralight.EXTRA_IS_UL_C, isUlc);
-                        break;
-                    }
-
-                    case TagTechnology.NFC_BARCODE: {
-                        // hard code this for now, this is the only valid type
-                        extras.putInt(NfcBarcode.EXTRA_BARCODE_TYPE, NfcBarcode.TYPE_KOVIO);
                         break;
                     }
 
@@ -805,7 +789,7 @@ public class NativeNfcTag implements TagEndpoint {
             int supportedNdefLength = ndefinfo[0];
             int cardState = ndefinfo[1];
             byte[] buff = readNdef();
-            if (buff != null && buff.length > 0) {
+            if (buff != null) {
                 try {
                     ndefMsg = new NdefMessage(buff);
                     addNdefTechnology(ndefMsg,
@@ -818,18 +802,17 @@ public class NativeNfcTag implements TagEndpoint {
                    // Create an intent anyway, without NDEF messages
                    generateEmptyNdef = true;
                 }
-            } else if(buff != null){
-                // Empty buffer, unformatted tags fall into this case
+            } else {
                 generateEmptyNdef = true;
             }
 
             if (generateEmptyNdef) {
                 ndefMsg = null;
                 addNdefTechnology(null,
-                      getConnectedHandle(),
-                      getConnectedLibNfcType(),
-                      getConnectedTechnology(),
-                      supportedNdefLength, cardState);
+                        getConnectedHandle(),
+                        getConnectedLibNfcType(),
+                        getConnectedTechnology(),
+                        supportedNdefLength, cardState);
                 foundFormattable = false;
                 reconnect();
             }
